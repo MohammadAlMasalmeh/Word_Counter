@@ -3,43 +3,80 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <string_view>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 
 // ===================================================================
-// CHARACTER TABLE
+// LOWERCASING
 // ===================================================================
-struct LowerTable {
-    unsigned char t[256];
-    constexpr LowerTable() : t{} {
-        for (int c = 'a'; c <= 'z'; ++c) t[c] = static_cast<unsigned char>(c);
-        for (int c = 'A'; c <= 'Z'; ++c) t[c] = static_cast<unsigned char>(c + 32);
+static constexpr size_t PAD = 64;
+
+static void lowerInto(const char *text, size_t n, uint8_t *out) {
+    auto *src = reinterpret_cast<const uint8_t *>(text);
+    size_t i = 0;
+#if defined(__ARM_NEON)
+    const uint8x16_t bit5 = vdupq_n_u8(0x20), a = vdupq_n_u8('a'), span = vdupq_n_u8(26);
+    for (; i + 16 <= n; i += 16) {
+        uint8x16_t x = vorrq_u8(vld1q_u8(src + i), bit5);
+        uint8x16_t isLetter = vcltq_u8(vsubq_u8(x, a), span);
+        vst1q_u8(out + i, vandq_u8(x, isLetter));
     }
-};
-static constexpr LowerTable LOWER{};
+#endif
+    for (; i < n; ++i) {
+        uint8_t x = src[i] | 0x20;
+        out[i] = (static_cast<uint8_t>(x - 'a') < 26) ? x : 0;
+    }
+    std::memset(out + n, 0, PAD);
+}
+
+static inline uint64_t nonZeroMask64(const uint8_t *p) {
+#if defined(__ARM_NEON)
+    static const uint8_t bitsArr[16] = {1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128};
+    const uint8x16_t bits = vld1q_u8(bitsArr);
+    uint8x16_t v0 = vld1q_u8(p), v1 = vld1q_u8(p + 16), v2 = vld1q_u8(p + 32), v3 = vld1q_u8(p + 48);
+    uint8x16_t t0 = vandq_u8(vtstq_u8(v0, v0), bits), t1 = vandq_u8(vtstq_u8(v1, v1), bits);
+    uint8x16_t t2 = vandq_u8(vtstq_u8(v2, v2), bits), t3 = vandq_u8(vtstq_u8(v3, v3), bits);
+    uint8x16_t s = vpaddq_u8(vpaddq_u8(t0, t1), vpaddq_u8(t2, t3));
+    s = vpaddq_u8(s, s);
+    return vgetq_lane_u64(vreinterpretq_u64_u8(s), 0);
+#else
+    uint64_t m = 0;
+    for (int k = 0; k < 64; ++k)
+        if (p[k]) m |= uint64_t(1) << k;
+    return m;
+#endif
+}
 
 
 // ===================================================================
 // HASHING
 // ===================================================================
-static inline uint64_t load64(const char *p) {
+static inline uint64_t load64(const uint8_t *p) {
     uint64_t v;
     std::memcpy(&v, p, 8);
     return v;
+}
+
+static inline uint64_t loadPartial(const uint8_t *p, uint32_t rem) {
+    uint64_t v = load64(p);
+    return rem >= 8 ? v : v & ((uint64_t(1) << (rem * 8)) - 1);
 }
 
 static inline uint64_t mix(uint64_t a, uint64_t b) {
@@ -48,16 +85,25 @@ static inline uint64_t mix(uint64_t a, uint64_t b) {
     return static_cast<uint64_t>(r) ^ static_cast<uint64_t>(r >> 64);
 }
 
-static inline uint64_t hashKey(const char *key, uint32_t len) {
-    uint64_t h = len;
-    for (uint32_t i = 0; i < len; i += 8)
-        h = mix(h, load64(key + i));
-    return mix(h, 0x8ebc6af09c88c6e3ull);
+struct WordRef {
+    uint64_t hash;
+    uint64_t head;
+    const uint8_t *tail;
+    uint32_t len;
+};
+
+static inline WordRef makeWord(const uint8_t *p, uint32_t len) {
+    WordRef w{0, loadPartial(p, len), p + 8, len};
+    uint64_t h = mix(w.head, len);
+    for (uint32_t i = 8; i < len; i += 8)
+        h = mix(h, loadPartial(p + i, len - i));
+    w.hash = h;
+    return w;
 }
 
-static inline bool keyEquals(const char *a, const char *b, uint32_t len) {
-    for (uint32_t i = 0; i < len; i += 8)
-        if (load64(a + i) != load64(b + i)) return false;
+static inline bool tailEquals(const uint8_t *a, const uint8_t *b, uint32_t tailLen) {
+    for (uint32_t i = 0; i < tailLen; i += 8)
+        if (loadPartial(a + i, tailLen - i) != loadPartial(b + i, tailLen - i)) return false;
     return true;
 }
 
@@ -65,89 +111,95 @@ static inline bool keyEquals(const char *a, const char *b, uint32_t len) {
 // ===================================================================
 // FLAT COUNTER
 // ===================================================================
-class Arena {
-    static constexpr size_t BLOCK = 1 << 20;
-    std::vector<std::unique_ptr<char[]>> blocks;
-    char *cur = nullptr;
-    size_t left = 0;
-
-public:
-    const char *store(const char *src, uint32_t len) {
-        size_t need = (static_cast<size_t>(len) + 7) & ~size_t(7);
-        if (need > left) {
-            size_t sz = std::max(BLOCK, need);
-            blocks.emplace_back(new char[sz]);
-            cur = blocks.back().get();
-            left = sz;
-        }
-        std::memcpy(cur, src, need);
-        const char *r = cur;
-        cur += need;
-        left -= need;
-        return r;
-    }
-
-    void clear() {
-        blocks.clear();
-        cur = nullptr;
-        left = 0;
-    }
-};
-
 class FlatCounter {
 public:
     struct Entry {
         uint64_t hash;
-        const char *key;
-        uint32_t len;
+        uint64_t head;
         uint64_t count;
+        uint32_t tailOff;
+        uint32_t len;
     };
 
 private:
     std::vector<Entry> slots;
     size_t mask;
     size_t used = 0;
-    Arena arena;
+    std::vector<uint8_t> arena;
 
     void grow() {
-        std::vector<Entry> old(slots.size() * 2, Entry{0, nullptr, 0, 0});
+        std::vector<Entry> old(slots.size() * 2, Entry{});
         old.swap(slots);
         mask = slots.size() - 1;
         for (const Entry &e : old) {
-            if (!e.key) continue;
+            if (!e.len) continue;
             size_t i = e.hash & mask;
-            while (slots[i].key) i = (i + 1) & mask;
+            while (slots[i].len) i = (i + 1) & mask;
             slots[i] = e;
         }
     }
 
-public:
-    explicit FlatCounter(size_t capacity = 1 << 14)
-        : slots(capacity, Entry{0, nullptr, 0, 0}), mask(capacity - 1) {}
+    uint32_t storeTail(const uint8_t *tail, uint32_t tailLen) {
+        size_t off = arena.size();
+        arena.resize(off + tailLen + 8);
+        std::memcpy(arena.data() + off, tail, tailLen);
+        return static_cast<uint32_t>(off);
+    }
 
-    void add(uint64_t hash, const char *key, uint32_t len, uint64_t c) {
-        if ((used + 1) * 2 > slots.size()) grow();
-        size_t i = hash & mask;
+    Entry *find(const WordRef &w) {
+        size_t i = w.hash & mask;
         while (true) {
             Entry &e = slots[i];
-            if (!e.key) {
-                e = Entry{hash, arena.store(key, len), len, c};
-                ++used;
-                return;
-            }
-            if (e.hash == hash && e.len == len && keyEquals(e.key, key, len)) {
-                e.count += c;
-                return;
-            }
+            if (!e.len) return &e;
+            if (e.hash == w.hash && e.head == w.head && e.len == w.len &&
+                (w.len <= 8 || tailEquals(arena.data() + e.tailOff, w.tail, w.len - 8)))
+                return &e;
             i = (i + 1) & mask;
         }
+    }
+
+public:
+    void addBatch(const WordRef *ws, size_t n) {
+        while ((used + n) * 2 > slots.size()) grow();
+        for (size_t k = 0; k < n; ++k) __builtin_prefetch(&slots[ws[k].hash & mask]);
+        for (size_t k = 0; k < n; ++k) add(ws[k], 1);
+    }
+
+    explicit FlatCounter(size_t capacity = 1 << 14)
+        : slots(capacity, Entry{}), mask(capacity - 1) {}
+
+    void add(const WordRef &w, uint64_t c) {
+        if ((used + 1) * 2 > slots.size()) grow();
+        Entry *e = find(w);
+        if (!e->len) {
+            uint32_t off = w.len > 8 ? storeTail(w.tail, w.len - 8) : 0;
+            *e = Entry{w.hash, w.head, 0, off, w.len};
+            ++used;
+        }
+        e->count += c;
+    }
+
+    void remove(const WordRef &w) {
+        Entry *e = find(w);
+        if (e->len) e->count = 0;
+    }
+
+    WordRef ref(const Entry &e) const {
+        return WordRef{e.hash, e.head, arena.data() + e.tailOff, e.len};
+    }
+
+    std::string word(const Entry &e) const {
+        std::string s(e.len, '\0');
+        std::memcpy(&s[0], &e.head, std::min<uint32_t>(e.len, 8));
+        if (e.len > 8) std::memcpy(&s[8], arena.data() + e.tailOff, e.len - 8);
+        return s;
     }
 
     size_t size() const { return used; }
     const std::vector<Entry> &entries() const { return slots; }
 
     void clear() {
-        std::fill(slots.begin(), slots.end(), Entry{0, nullptr, 0, 0});
+        std::fill(slots.begin(), slots.end(), Entry{});
         used = 0;
         arena.clear();
     }
@@ -157,7 +209,7 @@ public:
 // ===================================================================
 // STOP LIST
 // ===================================================================
-static const std::unordered_set<std::string_view> STOP_LIST = {
+static const char *const STOP_LIST[] = {
     // HTML/XML Entities & Tags
     "quot", "gt", "lt", "amp", "ref", "br", "span", "div", "small",
     "ul", "wul", "html", "class", "style", "align", "nbsp", "http",
@@ -180,25 +232,52 @@ static const std::unordered_set<std::string_view> STOP_LIST = {
 // TOKENIZER
 // ===================================================================
 class Tokenizer {
-    std::vector<char> buf = std::vector<char>(256);
+    static constexpr size_t BATCH = 64;
+    std::vector<uint8_t> low;
+    WordRef batch[BATCH];
 
 public:
     void countWords(std::string_view text, FlatCounter &freq) {
-        auto *p = reinterpret_cast<const unsigned char *>(text.data());
-        auto *end = p + text.size();
-        while (true) {
-            while (p < end && !LOWER.t[*p]) ++p;
-            if (p == end) break;
-            const unsigned char *start = p;
-            while (p < end && LOWER.t[*p]) ++p;
+        const size_t n = text.size();
+        if (low.size() < n + PAD) low.resize(n + PAD + n / 2);
+        lowerInto(text.data(), n, low.data());
+        const uint8_t *p = low.data();
 
-            uint32_t len = static_cast<uint32_t>(p - start);
-            if (len + 8 > buf.size()) buf.resize((len + 8) * 2);
-            char *w = buf.data();
-            for (uint32_t i = 0; i < len; ++i) w[i] = static_cast<char>(LOWER.t[start[i]]);
-            std::memset(w + len, 0, 8);
-            freq.add(hashKey(w, len), w, len, 1);
+        size_t nb = 0;
+        auto emit = [&](size_t start, size_t end) {
+            batch[nb++] = makeWord(p + start, static_cast<uint32_t>(end - start));
+            if (nb == BATCH) {
+                freq.addBatch(batch, nb);
+                nb = 0;
+            }
+        };
+
+        bool inWord = false;
+        size_t wordStart = 0;
+        uint64_t carry = 0;
+        for (size_t base = 0; base < n; base += 64) {
+            uint64_t m = nonZeroMask64(p + base);
+            uint64_t prev = (m << 1) | carry;
+            uint64_t starts = m & ~prev;
+            uint64_t ends = ~m & prev;
+            carry = m >> 63;
+
+            while (true) {
+                if (inWord) {
+                    if (!ends) break;
+                    emit(wordStart, base + __builtin_ctzll(ends));
+                    ends &= ends - 1;
+                    inWord = false;
+                } else {
+                    if (!starts) break;
+                    wordStart = base + __builtin_ctzll(starts);
+                    starts &= starts - 1;
+                    inWord = true;
+                }
+            }
         }
+        if (inWord) emit(wordStart, n);
+        freq.addBatch(batch, nb);
     }
 };
 
@@ -217,20 +296,13 @@ private:
 
     static size_t shardIndex(uint64_t hash) { return hash >> 56; }
 
-    template <typename F>
-    void forEachWord(F f) {
-        for (auto &s : shards) {
-            std::lock_guard<std::mutex> lock(s.mtx);
-            for (const auto &e : s.map.entries()) {
-                if (!e.key) continue;
-                std::string_view w(e.key, e.len);
-                if (STOP_LIST.count(w)) continue;
-                f(w, e.count);
-            }
-        }
-    }
-
 public:
+    struct Summary {
+        uint64_t totalWords = 0;
+        size_t uniqueWords = 0;
+        std::vector<std::pair<std::string, uint64_t>> top;
+    };
+
     ShardedWordCounter() : shards(NUM_SHARDS) {}
 
     void merge(const FlatCounter &local, size_t startShard) {
@@ -238,66 +310,63 @@ public:
 
         std::vector<uint32_t> offsets(NUM_SHARDS + 1, 0);
         for (const auto &e : entries)
-            if (e.key) ++offsets[shardIndex(e.hash) + 1];
+            if (e.len) ++offsets[shardIndex(e.hash) + 1];
         for (size_t i = 0; i < NUM_SHARDS; ++i) offsets[i + 1] += offsets[i];
         std::vector<const FlatCounter::Entry *> sorted(offsets[NUM_SHARDS]);
         std::vector<uint32_t> fill(offsets.begin(), offsets.end() - 1);
         for (const auto &e : entries)
-            if (e.key) sorted[fill[shardIndex(e.hash)]++] = &e;
+            if (e.len) sorted[fill[shardIndex(e.hash)]++] = &e;
 
         for (size_t k = 0; k < NUM_SHARDS; ++k) {
             size_t i = (startShard + k) % NUM_SHARDS;
             if (offsets[i] == offsets[i + 1]) continue;
             auto &s = shards[i];
             std::lock_guard<std::mutex> lock(s.mtx);
-            for (uint32_t j = offsets[i]; j < offsets[i + 1]; ++j) {
-                const auto *e = sorted[j];
-                s.map.add(e->hash, e->key, e->len, e->count);
-            }
+            for (uint32_t j = offsets[i]; j < offsets[i + 1]; ++j)
+                s.map.add(local.ref(*sorted[j]), sorted[j]->count);
         }
     }
 
-    // Memory-efficient getTopK using a min-heap
-    std::vector<std::pair<std::string, uint64_t>> getTopK(size_t k) {
-        using WordPair = std::pair<std::string_view, uint64_t>;
-        struct Compare {
-            bool operator()(const WordPair &a, const WordPair &b) {
-                return a.second > b.second; // Min-heap
-            }
-        };
-        std::priority_queue<WordPair, std::vector<WordPair>, Compare> minHeap;
+    Summary summarize(size_t k) {
+        for (const char *stop : STOP_LIST) {
+            uint32_t len = static_cast<uint32_t>(std::strlen(stop));
+            std::vector<uint8_t> buf(len + PAD, 0);
+            std::memcpy(buf.data(), stop, len);
+            WordRef w = makeWord(buf.data(), len);
+            auto &s = shards[shardIndex(w.hash)];
+            std::lock_guard<std::mutex> lock(s.mtx);
+            s.map.remove(w);
+        }
 
-        forEachWord([&](std::string_view w, uint64_t c) {
-            if (minHeap.size() < k) {
-                minHeap.push({w, c});
-            } else if (k > 0 && c > minHeap.top().second) {
-                minHeap.pop();
-                minHeap.push({w, c});
-            }
-        });
+        using Ranked = std::pair<uint64_t, std::pair<size_t, const FlatCounter::Entry *>>;
+        std::priority_queue<Ranked, std::vector<Ranked>, std::greater<Ranked>> minHeap;
 
-        std::vector<std::pair<std::string, uint64_t>> topItems;
-        topItems.reserve(minHeap.size());
+        Summary sum;
+        for (size_t si = 0; si < NUM_SHARDS; ++si) {
+            auto &s = shards[si];
+            std::lock_guard<std::mutex> lock(s.mtx);
+            for (const auto &e : s.map.entries()) {
+                if (!e.len || !e.count) continue;
+                sum.totalWords += e.count;
+                ++sum.uniqueWords;
+                if (minHeap.size() < k) {
+                    minHeap.push({e.count, {si, &e}});
+                } else if (k > 0 && e.count > minHeap.top().first) {
+                    minHeap.pop();
+                    minHeap.push({e.count, {si, &e}});
+                }
+            }
+        }
+
         while (!minHeap.empty()) {
-            topItems.emplace_back(std::string(minHeap.top().first), minHeap.top().second);
+            auto [count, where] = minHeap.top();
+            sum.top.emplace_back(shards[where.first].map.word(*where.second), count);
             minHeap.pop();
         }
-        std::sort(topItems.begin(), topItems.end(), [](auto &a, auto &b) {
+        std::sort(sum.top.begin(), sum.top.end(), [](auto &a, auto &b) {
             return a.second > b.second;
         });
-        return topItems;
-    }
-
-    size_t uniqueWords() {
-        size_t total = 0;
-        forEachWord([&](std::string_view, uint64_t) { ++total; });
-        return total;
-    }
-
-    uint64_t totalWords() {
-        uint64_t total = 0;
-        forEachWord([&](std::string_view, uint64_t c) { total += c; });
-        return total;
+        return sum;
     }
 };
 
@@ -469,6 +538,8 @@ int main(int argc, char *argv[]) {
     for (auto &t : workers)
         t.join();
 
+    auto summary = st.counter.summarize(topK);
+
     auto end = std::chrono::steady_clock::now();
     auto dur = std::chrono::duration<double>(end - start);
 
@@ -476,14 +547,13 @@ int main(int argc, char *argv[]) {
               << " MB in " << std::fixed << std::setprecision(2) << dur.count()
               << " seconds.\n" << std::defaultfloat;
     std::cout << "Total articles: " << st.articlesProcessed.load() << "\n";
-    std::cout << "Total words: " << st.counter.totalWords() << "\n";
-    std::cout << "Unique words: " << st.counter.uniqueWords() << "\n\n";
+    std::cout << "Total words: " << summary.totalWords << "\n";
+    std::cout << "Unique words: " << summary.uniqueWords << "\n\n";
 
-    auto top = st.counter.getTopK(topK);
     std::cout << "Top " << topK << " Words:\n";
     std::cout << std::string(40, '=') << "\n";
     int rank = 1;
-    for (auto &[w, c] : top)
+    for (auto &[w, c] : summary.top)
         std::cout << std::setw(4) << rank++ << ". " << std::setw(25) << w
                   << " : " << c << "\n";
 
