@@ -165,6 +165,12 @@ public:
         for (size_t k = 0; k < n; ++k) add(ws[k], 1);
     }
 
+    void addEntries(const FlatCounter &from, const Entry *const *es, size_t n) {
+        while ((used + n) * 2 > slots.size()) grow();
+        for (size_t k = 0; k < n; ++k) __builtin_prefetch(&slots[es[k]->hash & mask]);
+        for (size_t k = 0; k < n; ++k) add(from.ref(*es[k]), es[k]->count);
+    }
+
     explicit FlatCounter(size_t capacity = 1 << 14)
         : slots(capacity, Entry{}), mask(capacity - 1) {}
 
@@ -287,14 +293,14 @@ public:
 // ===================================================================
 class ShardedWordCounter {
 private:
-    static const size_t NUM_SHARDS = 256;
-    struct Shard {
+    static const size_t NUM_SHARDS = 2048;
+    struct alignas(128) Shard {
         FlatCounter map;
         std::mutex mtx;
     };
     std::vector<Shard> shards;
 
-    static size_t shardIndex(uint64_t hash) { return hash >> 56; }
+    static size_t shardIndex(uint64_t hash) { return hash >> 53; }
 
 public:
     struct Summary {
@@ -322,8 +328,7 @@ public:
             if (offsets[i] == offsets[i + 1]) continue;
             auto &s = shards[i];
             std::lock_guard<std::mutex> lock(s.mtx);
-            for (uint32_t j = offsets[i]; j < offsets[i + 1]; ++j)
-                s.map.add(local.ref(*sorted[j]), sorted[j]->count);
+            s.map.addEntries(local, sorted.data() + offsets[i], offsets[i + 1] - offsets[i]);
         }
     }
 
@@ -452,9 +457,10 @@ static size_t processRange(RangeReader &reader, size_t begin, size_t end,
 struct SharedState {
     int fd = -1;
     size_t fileSize = 0;
-    std::atomic<size_t> nextOffset{0};
-    std::atomic<size_t> bytesProcessed{0};
-    std::atomic<size_t> articlesProcessed{0};
+    alignas(128) std::atomic<size_t> nextOffset{0};
+    alignas(128) std::atomic<size_t> bytesProcessed{0};
+    alignas(128) std::atomic<size_t> articlesProcessed{0};
+    alignas(128) char pad_[128];
     ShardedWordCounter counter;
 
     std::mutex doneMtx;
@@ -557,6 +563,6 @@ int main(int argc, char *argv[]) {
         std::cout << std::setw(4) << rank++ << ". " << std::setw(25) << w
                   << " : " << c << "\n";
 
-    close(fd);
-    return 0;
+    std::cout.flush();
+    _exit(0);
 }
